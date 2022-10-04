@@ -1,0 +1,387 @@
+---
+- name: Influxdb-deployment
+  hosts: host1
+  gather_facts: false
+  tasks:
+    - name: Copying files
+      ansible.builtin.copy:
+        src: /mnt/c/VSCode/Kubernetes/grafana  #copying grafana config files to host machine
+        dest: /home/hsingh5/                   #grafana/config
+        owner: hsingh5                         #       |
+        group: hsingh5                         #       |-> dashboards/templates for grafana dashboards
+        mode: o=rwx,g=rwx,u=rwx                #       |-> provisioning/dashboards/dashboards.yml    path to the dashboard files   
+                                               #       |-> provisioning/datasources/influxdb.yml     (required) define datasource 
+
+
+    - name: Create a namespace                 # create a kubernetes for TIG stack
+      kubernetes.core.k8s:
+        name: tig
+        api_version: v1
+        kind: Namespace
+        state: present
+#Influxdb dependencies ############################################################################################ 
+    - name: Creating Secrets
+      kubernetes.core.k8s:
+        definition:
+           apiVersion: v1                    # Define Secrets for influxdb(base64)
+           kind: Secret
+           metadata:
+             name: influxdb-secrets
+             namespace: tig
+           type: Opaque
+           data:
+             
+             INFLUXDB_ADMIN_USER: YWRtaW4=
+             INFLUXDB_ADMIN_PASSWORD: QyFzY28xMjM0NQ==
+            
+             INFLUXDB_USER: aHNpbmdoNQ==
+             INFLUXDB_USER_PASSWORD: QyFzY28xMjM0NQ==
+           
+
+             
+               
+
+    - name: Creating Persistence Volume Claim        # Peristent Volume claim used by influxdb
+      kubernetes.core.k8s:
+        definition:
+           apiVersion: v1
+           kind: PersistentVolumeClaim             
+           metadata:
+             name: influxdb-data
+             namespace: tig
+           spec:
+             
+             accessModes:
+               - ReadWriteOnce
+             resources:
+               requests:
+                 storage: 3Gi
+           
+
+    - name: Creating Config Map          # create influxdb.conf file using config map 
+      kubernetes.core.k8s:
+        definition:
+           apiVersion: v1
+           kind: ConfigMap
+           metadata:
+             name: influxdb-config  
+             namespace: tig
+           data: 
+             influxdb.conf: |
+               reporting-disabled = false
+               
+               [meta]
+                dir = "/var/lib/influxdb/meta"
+                retention-autocreate = true
+                logging-enabled = true
+               [data]
+                dir = "/var/lib/influxdb/data"
+                engine = "tsm1"
+                wal-dir = "/var/lib/influxdb/wal"
+               [http]
+                enabled = true
+                bind-address = ":8086"
+                flux-enabled = true
+              
+             INFLUXDB_CONFIG_PATH: /etc/influxdb/influxdb.conf
+             INFLUXDB_DB: telemetry
+  #Create an Influxdb Pod ############################################################################################# 
+    - name: Create a Influxdb Deployment
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: influxdb
+            namespace: tig
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: influxdb
+            minReadySeconds: 5
+            template:
+              metadata:
+                labels:
+                 app: influxdb
+              spec:
+                containers:
+                - image: influxdb:1.8
+                  name: influxdb
+                  ports:
+                  - containerPort: 8086
+                  volumeMounts:
+                    - mountPath: /var/lib/influxdb
+                      name: influxdb-data
+                    - mountPath: /etc/influxdb/influxdb.conf
+                      name: influxdb-config
+                      subPath: influxdb.conf
+                      ReadOnly: true
+                  env:
+                    - name: INFLUXDB_CONFIG_PATH
+                      valueFrom:
+                        configMapKeyRef:
+                          name: influxdb-config
+                          key: INFLUXDB_CONFIG_PATH
+                    - name: INFLUXDB_ADMIN_USER
+                      valueFrom:
+                        secretKeyRef:
+                          name: influxdb-secrets
+                          key: INFLUXDB_ADMIN_USER
+
+                    - name: INFLUXDB_ADMIN_PASSWORD
+                      valueFrom:
+                        secretKeyRef:
+                          name: influxdb-secrets
+                          key: INFLUXDB_ADMIN_PASSWORD        
+
+                    - name: INFLUXDB_DB
+                      valueFrom:
+                        configMapKeyRef:
+                          name: influxdb-config
+                          key: INFLUXDB_DB
+
+                    - name: INFLUXDB_USER
+                      valueFrom:
+                        secretKeyRef:
+                          name: influxdb-secrets
+                          key: INFLUXDB_USER  
+
+                    - name: INFLUXDB_USER_PASSWORD
+                      valueFrom:
+                        secretKeyRef:
+                          name: influxdb-secrets
+                          key: INFLUXDB_USER_PASSWORD 
+                volumes:
+                  - name: influxdb-data
+                    persistentVolumeClaim:
+                      claimName: influxdb-data
+                  - name: influxdb-config
+                    configMap:
+                      name: influxdb-config
+
+    - name: Create a influxdb internal Service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: influxdb-service
+            namespace: tig
+          spec:
+            selector:
+              app: influxdb
+            ports:
+              - protocol: TCP
+                port: 8086
+                targetPort: 8086
+                
+
+    - name: Creating Config Map for telegraf  # configmap for telegraf configuration
+      kubernetes.core.k8s:
+        definition:
+           apiVersion: v1
+           kind: ConfigMap
+           metadata:
+             name: telegraf-config
+             namespace: tig
+           data: 
+             telegraf.conf: |
+               [agent]
+
+                interval = "10s"
+  
+                round_interval = true
+                debug = true
+                quiet = false
+               [[inputs.cpu]]
+      
+                percpu = true
+                totalcpu = true
+                collect_cpu_time = false
+                report_active = false
+               [[inputs.disk]]
+                ignore_fs = ["tmpfs", "devtmpfs", "devfs", "overlay", "aufs", "squashfs"]
+
+               [[inputs.cisco_telemetry_mdt]]
+                ##transport = "grpc"
+
+                ##service_address = "${TELEGRAF_SERVICE}"
+                ##max_msg_size = 4000000
+               [[outputs.influxdb]]
+                urls = ["${INFLUXDB_URL}"]
+                username= "${INFLUXDB_USER}"
+                password="${INFLUXDB_USER_PASSWORD}"
+                
+                database = "${INFLUXDB_DB}"
+
+              
+             TELEGRAF_CONFIG_PATH: /etc/telegraf/telegraf.conf
+             INFLUXDB_USER: hsingh5
+             INFLUXDB_USER_PASSWORD: C!sco12345
+             INFLUXDB_URL: http://influxdb-service:8086
+          
+             TELEGRAF_SERVICE: tcp://telegraf-external-service:57500
+    
+    - name: Create a  Telegraf Pod
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: telegraf
+            namespace: tig
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: telegraf
+            minReadySeconds: 5
+            template:
+              metadata:
+                labels:
+                 app: telegraf
+              spec:
+                containers:
+                - image: telegraf:1.21
+                  name: telegraf
+                  ports:
+                  - containerPort: 8086
+                  volumeMounts:
+                    - mountPath: /etc/telegraf/telegraf.conf
+                      name: telegraf-config
+                      subPath: telegraf.conf
+                      ReadOnly: true
+                  env:
+                    - name: TELEGRAF_CONFIG_PATH
+                      valueFrom:
+                        configMapKeyRef:
+                          name: telegraf-config
+                          key: TELEGRAF_CONFIG_PATH  
+
+                    - name: INFLUXDB_DB
+                      valueFrom:
+                        configMapKeyRef:
+                          name: influxdb-config
+                          key: INFLUXDB_DB
+
+                    
+                    - name: TELEGRAF_EXTERNAL_SERVICE
+                      valueFrom:
+                        configMapKeyRef:
+                          name: telegraf-config
+                          key: TELEGRAF_SERVICE
+
+                    - name: INFLUXDB_URL
+                      valueFrom:
+                        configMapKeyRef:
+                          name: telegraf-config
+                          key: INFLUXDB_URL
+                    
+                    - name: INFLUXDB_USER
+                      valueFrom:
+                        configMapKeyRef:
+                          name: telegraf-config
+                          key: INFLUXDB_USER
+
+                    - name: INFLUXDB_USER_PASSWORD
+                      valueFrom:
+                        configMapKeyRef:
+                          name: telegraf-config
+                          key: INFLUXDB_USER_PASSWORD
+                   
+                volumes:
+                  - name: telegraf-config
+                    configMap:
+                      name: telegraf-config
+
+    - name: Create a telegraf external Service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: telegraf-external-service
+            namespace: tig
+          spec:
+            selector:
+              app: influxdb
+            type: LoadBalancer
+            ports:
+              - protocol: TCP
+                port: 57500
+                targetPort: 57500
+                nodePort: 30001
+
+    - name: Grafana Deployment
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: grafana
+            namespace: tig
+
+          spec:
+            selector:
+              matchLabels:
+                app: grafana
+            minReadySeconds: 5
+            template:
+              metadata:
+                labels:
+                  app: grafana
+              spec:
+                containers:
+                - image: grafana/grafana-enterprise
+                  name: grafana
+                  ports:
+                    - containerPort: 3000
+                  volumeMounts:
+                    - mountPath: /etc/grafana/provisioning
+                      name: grafana-volume
+                      subPath: provisioning/
+                    - mountPath: /var/lib/grafana/dashboards
+                      name: grafana-volume
+                      subPath: dashboards/
+                    - mountPath: /etc/grafana/grafana.ini
+                      name: grafana-volume
+                      subPath: grafana.ini
+                      readOnly: true
+                restartPolicy: Always
+                env:
+                  - name: GF_SECURITY_ADMIN_PASSWORD
+                    value: C!sco12345
+                volumes:
+                - name: grafana-volume
+                  hostPath:
+                    path: /grafana
+    
+
+    - name: Creating a Grafana Service
+      kubernetes.core.k8s:
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: grafana-service
+            namespace: tig
+          spec:
+            selector:
+              app: grafana
+            type: NodePort
+            ports:
+              - protocol: TCP
+                port: 3000
+                targetPort: 3000
+                nodePort: 30002
+
+    - name: Starting grafana service
+      ansible.builtin.shell: minikube service --url grafana-service
+      args: 
+        chdir: /home/hsingh5/
+
+    - name: Starting telegraf service
+      ansible.builtin.command: minikube service --url telegraf-external-service
+      args:
+        chdir: /home/hsingh5/
